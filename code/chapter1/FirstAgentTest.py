@@ -142,10 +142,10 @@ import re
 
 # --- 1. 配置LLM客户端 ---
 # 请根据您使用的服务，将这里替换成对应的凭证和地址
-API_KEY = "YOUR_API_KEY"
-BASE_URL = "YOUR_BASE_URL"
-MODEL_ID = "YOUR_MODEL_ID"
-os.environ['TAVILY_API_KEY'] = "YOUR_TAVILY_API_KEY"
+API_KEY = "sk-9019e086a2a74156ad570349a20f3e76"
+BASE_URL = "https://api.deepseek.com"
+MODEL_ID = "deepseek-v4-flash"
+os.environ['TAVILY_API_KEY'] = "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"
 
 llm = OpenAICompatibleClient(
     model=MODEL_ID,
