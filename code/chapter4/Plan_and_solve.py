@@ -1,5 +1,6 @@
 import os
 import ast
+from datetime import datetime
 from llm_client import HelloAgentsLLM
 from dotenv import load_dotenv
 from typing import List, Dict
@@ -21,6 +22,8 @@ PLANNER_PROMPT_TEMPLATE = """
 请确保计划中的每个步骤都是一个独立的、可执行的子任务，并且严格按照逻辑顺序排列。
 你的输出必须是一个Python列表，其中每个元素都是一个描述子任务的字符串。
 
+当前时间: {current_time}
+
 问题: {question}
 
 请严格按照以下格式输出你的计划，```python与```作为前后缀是必要的:
@@ -34,7 +37,8 @@ class Planner:
         self.llm_client = llm_client
 
     def plan(self, question: str) -> list[str]:
-        prompt = PLANNER_PROMPT_TEMPLATE.format(question=question)
+        current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        prompt = PLANNER_PROMPT_TEMPLATE.format(current_time=current_time, question=question)
         messages = [{"role": "user", "content": prompt}]
         
         print("--- 正在生成计划 ---")

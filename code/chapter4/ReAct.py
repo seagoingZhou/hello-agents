@@ -1,10 +1,13 @@
 import re
+from datetime import datetime
 from llm_client import HelloAgentsLLM
 from tools import ToolExecutor, search
 
 # (此处省略 REACT_PROMPT_TEMPLATE 的定义)
 REACT_PROMPT_TEMPLATE = """
 请注意，你是一个有能力调用外部工具的智能助手。
+
+当前时间: {current_time}
 
 可用工具如下：
 {tools}
@@ -40,7 +43,10 @@ class ReActAgent:
 
             tools_desc = self.tool_executor.getAvailableTools()
             history_str = "\n".join(self.history)
-            prompt = REACT_PROMPT_TEMPLATE.format(tools=tools_desc, question=question, history=history_str)
+            current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+            prompt = REACT_PROMPT_TEMPLATE.format(
+                current_time=current_time, tools=tools_desc, question=question, history=history_str
+            )
 
             messages = [{"role": "user", "content": prompt}]
             response_text = self.llm_client.think(messages=messages)
@@ -82,11 +88,11 @@ class ReActAgent:
         return thought, action
 
     def _parse_action(self, action_text: str):
-        match = re.match(r"(\w+)\[(.*)\]", action_text, re.DOTALL)
+        match = re.match(r"(\w+)\[(.*?)\]", action_text, re.DOTALL)
         return (match.group(1), match.group(2)) if match else (None, None)
 
     def _parse_action_input(self, action_text: str):
-        match = re.match(r"\w+\[(.*)\]", action_text, re.DOTALL)
+        match = re.match(r"\w+\[(.*?)\]", action_text, re.DOTALL)
         return match.group(1) if match else ""
 
 if __name__ == '__main__':
