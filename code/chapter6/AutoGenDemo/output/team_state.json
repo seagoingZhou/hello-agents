@@ -1,0 +1,9 @@
+{
+  "team": "<coroutine object BaseGroupChat.save_state at 0x1125d6940>",
+  "agents": {
+    "ProductManager": "<coroutine object AssistantAgent.save_state at 0x130f37b90>",
+    "Engineer": "<coroutine object AssistantAgent.save_state at 0x130f36cf0>",
+    "CodeReviewer": "<coroutine object AssistantAgent.save_state at 0x11259f440>"
+  },
+  "saved_at": "2026-05-12T00:41:28.169683"
+}

@@ -1,32 +1,52 @@
 """
-AutoGen 软件开发团队协作案例
+AutoGen 软件开发团队协作案例 — 支持对话记录、状态保存/恢复、各 Agent 产出物提取（流式即时保存）
 """
 
 import os
 import asyncio
-from typing import List, Dict, Any
+import json
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
-# 加载环境变量
 load_dotenv()
 
-# 先测试一个版本，使用 OpenAI 客户端
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.conditions import TextMentionTermination
 from autogen_agentchat.ui import Console
+from autogen_agentchat.messages import TextMessage
+from autogen_agentchat.base._task import TaskResult
+
+# ----- 输出目录 -----
+OUTPUT_DIR = Path(__file__).parent / "output"
+CONVERSATION_FILE = OUTPUT_DIR / "conversation_log.json"
+STATE_FILE = OUTPUT_DIR / "team_state.json"
+ARTIFACTS_DIR = OUTPUT_DIR / "artifacts"
+
 
 def create_openai_model_client():
-    """创建 OpenAI 模型客户端用于测试"""
     return OpenAIChatCompletionClient(
-        model=os.getenv("LLM_MODEL_ID", "gpt-4o"),
+        model=os.getenv("LLM_MODEL_ID"),
         api_key=os.getenv("LLM_API_KEY"),
-        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+        base_url=os.getenv("LLM_BASE_URL"),
+        model_info={
+            "function_calling": True,
+            "max_tokens": 4096,
+            "context_length": 32768,
+            "vision": False,
+            "json_output": True,
+            "family": "deepseek",
+            "structured_output": True,
+        }
     )
 
+
 def create_product_manager(model_client):
-    """创建产品经理智能体"""
     system_message = """你是一位经验丰富的产品经理，专门负责软件产品的需求分析和项目规划。
 
 你的核心职责包括：
@@ -50,8 +70,8 @@ def create_product_manager(model_client):
         system_message=system_message,
     )
 
+
 def create_engineer(model_client):
-    """创建软件工程师智能体"""
     system_message = """你是一位资深的软件工程师，擅长 Python 开发和 Web 应用构建。
 
 你的技术专长包括：
@@ -75,8 +95,8 @@ def create_engineer(model_client):
         system_message=system_message,
     )
 
+
 def create_code_reviewer(model_client):
-    """创建代码审查员智能体"""
     system_message = """你是一位经验丰富的代码审查专家，专注于代码质量和最佳实践。
 
 你的审查重点包括：
@@ -100,8 +120,8 @@ def create_code_reviewer(model_client):
         system_message=system_message,
     )
 
+
 def create_user_proxy():
-    """创建用户代理智能体"""
     return UserProxyAgent(
         name="UserProxy",
         description="""用户代理，负责以下职责：
@@ -113,38 +133,138 @@ def create_user_proxy():
 完成测试后请回复 TERMINATE。""",
     )
 
-async def run_software_development_team():
-    """运行软件开发团队协作"""
-    
+
+# ---------- 状态持久化 ----------
+
+def save_team_state(team: RoundRobinGroupChat, agents: Dict[str, AssistantAgent], filepath: Path):
+    state = {
+        "team": team.save_state(),
+        "agents": {name: agent.save_state() for name, agent in agents.items()},
+        "saved_at": datetime.now().isoformat(),
+    }
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    filepath.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str))
+
+
+def load_team_state(filepath: Path) -> Optional[Dict]:
+    if not filepath.exists():
+        return None
+    return json.loads(filepath.read_text())
+
+
+def restore_team_state(team: RoundRobinGroupChat, agents: Dict[str, AssistantAgent], state: Dict):
+    team.load_state(state["team"])
+    for name, agent in agents.items():
+        if name in state["agents"]:
+            agent.load_state(state["agents"][name])
+
+
+# ---------- 流式即时保存 ----------
+
+def extract_code_blocks(content: str) -> list[str]:
+    blocks = []
+    for match in re.finditer(r"```(?:python)?\s*\n(.*?)```", content, re.DOTALL):
+        blocks.append(match.group(1).strip())
+    return blocks
+
+
+class StreamSaver:
+    """消费流事件，每当 Agent 产出消息时即时保存"""
+
+    def __init__(self, team_chat: RoundRobinGroupChat, agents: Dict[str, AssistantAgent]):
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.team_chat = team_chat
+        self.agents = agents
+        self.messages: list[dict] = []
+        self._agent_code_counters: Dict[str, int] = {}
+
+    def on_text_message(self, msg: TextMessage):
+        """每条 TextMessage 到达时立即调用"""
+        entry = {
+            "source": msg.source,
+            "content": msg.content,
+            "type": msg.type,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        }
+        self.messages.append(entry)
+
+        # 1. 追加到该 Agent 的完整响应文件
+        agent_file = ARTIFACTS_DIR / f"{msg.source}_full_response.md"
+        timestamp = msg.created_at.strftime("%H:%M:%S") if msg.created_at else "--"
+        with open(agent_file, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}]\n{msg.content}\n\n")
+
+        # 2. 如果有代码块，提取保存
+        code_blocks = extract_code_blocks(msg.content)
+        if code_blocks:
+            counter = self._agent_code_counters.get(msg.source, 0)
+            for code in code_blocks:
+                counter += 1
+                code_file = ARTIFACTS_DIR / f"{msg.source}_code_{counter}.py"
+                code_file.write_text(code, encoding="utf-8")
+                print(f"📄 提取到代码: {code_file}")
+            self._agent_code_counters[msg.source] = counter
+
+        # 3. 增量更新对话日志 JSON
+        log = {
+            "saved_at": datetime.now().isoformat(),
+            "total_messages": len(self.messages),
+            "messages": self.messages,
+        }
+        CONVERSATION_FILE.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+
+        # 4. 更新团队状态（用于断点续跑）
+        self._save_state_checkpoint()
+
+    def _save_state_checkpoint(self):
+        """每次消息后保存状态，保证中断可恢复"""
+        save_team_state(self.team_chat, self.agents, STATE_FILE)
+
+    def summary(self):
+        print(f"\n📦 产出物保存到: {OUTPUT_DIR.resolve()}")
+        print(f"   - 对话日志: {CONVERSATION_FILE.name} ({len(self.messages)} 条)")
+        print(f"   - 状态存档: {STATE_FILE.name}")
+        print(f"   - 各Agent产出: {ARTIFACTS_DIR.name}/")
+
+
+# ---------- 主流程 ----------
+
+async def run_software_development_team(resume: bool = False):
     print("🔧 正在初始化模型客户端...")
-    
-    # 先使用标准的 OpenAI 客户端测试
     model_client = create_openai_model_client()
-    
+
     print("👥 正在创建智能体团队...")
-    
-    # 创建智能体团队
+
     product_manager = create_product_manager(model_client)
     engineer = create_engineer(model_client)
     code_reviewer = create_code_reviewer(model_client)
     user_proxy = create_user_proxy()
-    
-    # 添加终止条件
+
+    agents = {
+        "ProductManager": product_manager,
+        "Engineer": engineer,
+        "CodeReviewer": code_reviewer,
+    }
+
     termination = TextMentionTermination("TERMINATE")
-    
-    # 创建团队聊天
+
     team_chat = RoundRobinGroupChat(
-        participants=[
-            product_manager,
-            engineer, 
-            code_reviewer,
-            user_proxy
-        ],
+        participants=[product_manager, engineer, code_reviewer, user_proxy],
         termination_condition=termination,
-        max_turns=20,  # 增加最大轮次
+        max_turns=20,
     )
-    
-    # 定义开发任务
+
+    if resume:
+        state = load_team_state(STATE_FILE)
+        if state:
+            restore_team_state(team_chat, agents, state)
+            print("✅ 从存档恢复，继续之前的协作...")
+        else:
+            print("❌ 无法恢复状态，将重新开始。")
+            return None
+
     task = """我们需要开发一个比特币价格显示应用，具体要求如下：
 
 核心功能：
@@ -158,29 +278,53 @@ async def run_software_development_team():
 - 添加适当的错误处理和加载状态
 
 请团队协作完成这个任务，从需求分析到最终实现。"""
-    
-    # 执行团队协作
+
     print("🚀 启动 AutoGen 软件开发团队协作...")
     print("=" * 60)
-    
-    # 使用 Console 来显示对话过程
-    result = await Console(team_chat.run_stream(task=task))
-    
-    print("\n" + "=" * 60)
-    print("✅ 团队协作完成！")
-    
-    return result
+
+    saver = StreamSaver(team_chat, agents)
+    messages_collected: list = []
+
+    try:
+        async for event in team_chat.run_stream(task=task):
+            # 实时打印到控制台
+            Console.print_event(event)
+
+            if isinstance(event, TextMessage):
+                saver.on_text_message(event)
+                messages_collected.append(event)
+            elif isinstance(event, TaskResult):
+                messages_collected = list(event.messages) if event.messages else messages_collected
+
+    except KeyboardInterrupt:
+        print("\n⏸️  协作被中断，已保存的内容不会丢失。")
+        print("   使用 --resume 可从断点继续。")
+    except Exception:
+        # 异常时也要保存当前状态
+        import traceback
+        traceback.print_exc()
+        print("\n⚠️  异常退出，已保存的内容不会丢失。")
+        print("   使用 --resume 可从断点继续。")
+    else:
+        print("\n" + "=" * 60)
+        print("✅ 团队协作完成！")
+    finally:
+        saver._save_state_checkpoint()
+
+    saver.summary()
+    return TaskResult(messages=messages_collected, stop_reason="completed")
+
 
 # 主程序入口
 if __name__ == "__main__":
+    resume = "--resume" in sys.argv
     try:
-        # 运行异步协作流程
-        result = asyncio.run(run_software_development_team())
-        
-        print(f"\n📋 协作结果摘要：")
-        print(f"- 参与智能体数量：4个")
-        print(f"- 任务完成状态：{'成功' if result else '需要进一步处理'}")
-        
+        result = asyncio.run(run_software_development_team(resume=resume))
+        if result:
+            print(f"\n📋 协作结果摘要：")
+            print(f"- 参与智能体数量：4个")
+            msg_count = len(result.messages) if hasattr(result, 'messages') else 0
+            print(f"- 消息总数：{msg_count}")
     except ValueError as e:
         print(f"❌ 配置错误：{e}")
         print("请检查 .env 文件中的配置是否正确")
@@ -188,6 +332,3 @@ if __name__ == "__main__":
         print(f"❌ 运行错误：{e}")
         import traceback
         traceback.print_exc()
-
-
-
